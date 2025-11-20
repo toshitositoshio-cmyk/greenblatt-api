@@ -14,7 +14,7 @@ class ExternalDataTooLargeError(Exception):
 
 
 # =============================
-# レスポンスモデル
+# /stock-summary 用レスポンスモデル
 # =============================
 class StockSummary(BaseModel):
     code: str
@@ -30,8 +30,8 @@ class StockSummary(BaseModel):
     summary_text: Optional[str] = None
     raw_data: Optional[Dict[str, Any]] = None
 
-    # ★ エラーを内包して返すためのフィールド
-    status: str = "ok"                # "ok" or "error"
+    # エラー情報（常に含める）
+    status: str = "ok"  # "ok" or "error"
     error_code: Optional[str] = None
     error_message: Optional[str] = None
 
@@ -42,10 +42,10 @@ class StockSummary(BaseModel):
 async def fetch_and_build_summary(code: str):
     """
     外部データを取得して各種指標をまとめる関数。
-    ここをあなたの実際のロジックに置き換えてください。
+    本番ではここに実際の決算データ取得ロジックを実装する。
 
     必要なら「大きすぎるPDFを検知して」
-    raise ExternalDataTooLargeError を投げるようにします。
+    raise ExternalDataTooLargeError を投げるようにする。
     """
 
     # ▼（例）外部データが重すぎると判断した場合に例外を投げる
@@ -73,14 +73,18 @@ async def fetch_and_build_summary(code: str):
 
 
 # =============================
-# メインAPI（エラーを必ず吸収）
+# メインAPI（GET /stock-summary）
 # =============================
 @app.get("/stock-summary", response_model=StockSummary)
 async def get_stock_summary(
     code: str = Query(..., description="日本株の銘柄コード（例: 6227）")
 ):
+    """
+    Custom GPT の getStockSummary アクションから呼ばれるエンドポイント。
+    銘柄コードを受け取り、構造転換 × 黒字転換 × 高ROIC の観点でまとめたサマリーを返す。
+    """
     try:
-        # 実データ取得
+        # 実データ取得（今はダミー）
         summary = await fetch_and_build_summary(code)
 
         return StockSummary(
@@ -98,7 +102,7 @@ async def get_stock_summary(
             raw_data=summary.raw_data,
         )
 
-    # ★ 外部データの容量エラーに対処
+    # 外部データの容量エラーに対処
     except ExternalDataTooLargeError:
         return StockSummary(
             status="error",
@@ -110,7 +114,7 @@ async def get_stock_summary(
             ),
         )
 
-    # ★ 予期せぬエラーも必ず 200 で返す
+    # 想定外エラーも必ず 200 で返して GPT が読めるようにする
     except Exception as e:
         return StockSummary(
             status="error",
@@ -118,3 +122,83 @@ async def get_stock_summary(
             error_code="UNEXPECTED_ERROR",
             error_message=f"銘柄コード {code} の処理中に予期せぬエラー: {type(e).__name__}: {e}",
         )
+
+
+# =============================
+# GPT から受け取る決算データ用モデル
+# =============================
+class FinancialInput(BaseModel):
+    code: str
+    name: Optional[str] = None
+    market: Optional[str] = None
+
+    # GPTが抽出して送る決算・財務データ
+    sales: Optional[float] = None
+    sales_yoy: Optional[float] = None
+    op_income: Optional[float] = None
+    op_income_yoy: Optional[float] = None
+    gross_margin: Optional[float] = None
+    op_margin: Optional[float] = None
+    nopat: Optional[float] = None
+    invested_capital: Optional[float] = None
+    roic: Optional[float] = None
+    earnings_yield: Optional[float] = None
+
+    # 株価指標
+    price: Optional[float] = None
+    vwap: Optional[float] = None
+    ma25: Optional[float] = None
+    ma75: Optional[float] = None
+
+    # 需給データ
+    credit_ratio: Optional[float] = None
+
+    # 追加で任意のデータも受け取れる
+    extra: Optional[Dict[str, Any]] = None
+
+
+# =============================
+# POST /process-financials
+# GPT からの JSON を受け取って解析
+# =============================
+@app.post("/process-financials")
+async def process_financials(data: FinancialInput):
+    """
+    ChatGPT が Web/ブラウズで取得した決算データ(JSON)を受け取り、
+    Greenblatt型の簡易判定を行って返すエンドポイント。
+    """
+
+    # ROIC 計算
+    if data.roic is not None:
+        roic = data.roic
+    elif data.nopat is not None and data.invested_capital:
+        roic = (data.nopat / data.invested_capital) * 100
+    else:
+        roic = None
+
+    # Earnings Yield
+    ey = data.earnings_yield
+
+    # Greenblatt スコア（超シンプルな例）
+    score = 0.0
+    if roic is not None:
+        score += min(roic, 30) * 1.5  # ROIC 30%上限でウェイト1.5
+    if ey is not None:
+        score += min(ey, 20) * 1.0    # EY 20%上限でウェイト1.0
+
+    verdict = "HOLD"
+    if roic is not None and ey is not None:
+        if roic > 15 and ey > 10:
+            verdict = "BUY"
+        elif roic < 5:
+            verdict = "EXIT"
+
+    return {
+        "code": data.code,
+        "name": data.name,
+        "roic": roic,
+        "ey": ey,
+        "greenblatt_score": score,
+        "verdict": verdict,
+        "raw": data.dict()
+    }
